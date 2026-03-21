@@ -13,6 +13,7 @@ from archinfo import Arch, ArchARMCortexM, ArchPcode, Endness
 from typing_extensions import override
 
 from angr.errors import SimMemoryError
+from angr.sim_procedure import SimProcedure
 from angr.engines.concrete import ConcreteEngine, HeavyConcreteState
 from angr.engines.failure import SimEngineFailure
 from angr.engines.hook import HooksMixin
@@ -774,9 +775,87 @@ class IcicleEngine(ConcreteEngine):
         return result
 
 
+def _extract_libc_start_main_args(state, main, argc, argv, init, fini):
+    """Wrapper to avoid Python name-mangling of ``__libc_start_main``."""
+    from angr.procedures.glibc.__libc_start_main import __libc_start_main  # noqa: N812
+
+    return __libc_start_main._extract_args(state, main, argc, argv, init, fini)
+
+
+class _ConcreteLibcStartMain(SimProcedure):
+    """Lightweight ``__libc_start_main`` for concrete (icicle) execution.
+
+    The standard angr ``__libc_start_main`` SimProcedure cannot be reused
+    because it runs ``.init``/``.init_array`` constructors via
+    ``self.call()``, causing expensive emulator round-trips through code
+    that depends on TLS and locale internals icicle doesn't emulate.  It
+    also pushes angr's ``CallReturn`` hook as main's return address, but
+    the fuzzer expects a sentinel (``0xDEADBEEF``) so its breakpoint can
+    catch main's return cleanly.
+
+    This replacement skips all glibc init and jumps straight to main.
+    """
+
+    NO_RET = True
+
+    def run(self, main, argc, argv, init, fini):
+        main, argc, argv, _, _ = _extract_libc_start_main_args(
+            self.state, main, argc, argv, init, fini
+        )
+        self.state.regs.rdi = argc
+        self.state.regs.rsi = argv
+        envp = argv + (argc + 1) * self.state.arch.bytes
+        self.state.regs.rdx = envp
+        # Overwrite _start's return address with a sentinel so the
+        # fuzzer's breakpoint fires when main returns.
+        import claripy
+
+        self.state.memory.store(
+            self.state.regs.sp,
+            claripy.BVV(0xDEADBEEF, self.state.arch.bits),
+            endness=self.state.arch.memory_endness,
+        )
+        self.jump(main)
+
+
 class UberIcicleEngine(SimEngineFailure, SimEngineSyscall, HooksMixin, IcicleEngine):
     """
     An extension of the IcicleEngine that uses mixins to add support for
     syscalls and hooks. Most users will prefer to use this engine instead of the
     IcicleEngine directly.
     """
+
+    def setup_concrete_hooks(self) -> None:
+        """Install hooks needed for concrete execution of dynamically-linked
+        binaries.
+
+        Hooks ``__libc_start_main`` with a lightweight replacement that skips
+        glibc init and jumps directly to ``main``.  The standard angr
+        ``__libc_start_main`` SimProcedure cannot be reused here because it:
+
+        - Runs ``.init`` / ``.init_array`` constructors via ``self.call()``,
+          which triggers expensive emulator round-trips and may execute code
+          that depends on TLS, locale, or other glibc internals that icicle
+          does not emulate.
+        - Uses ``self.call(main, ...)`` which pushes angr's ``CallReturn``
+          hook address as the return address.  The fuzzer's executor expects
+          a sentinel value (``0xDEADBEEF``) on the stack so its breakpoint
+          catches ``main``'s return cleanly.
+
+        Also hooks ``exit``/``_exit``/``_Exit`` using the existing
+        ``angr.procedures.libc.exit`` SimProcedure for immediate termination
+        without glibc cleanup (atexit handlers, stdio flushing) which loops
+        under icicle.
+
+        Safe to call multiple times — existing hooks are not overwritten.
+        """
+        from angr.procedures.libc.exit import exit as ExitProcedure
+
+        proj = self.project
+        sym = proj.loader.find_symbol("__libc_start_main")
+        if sym is not None and sym.rebased_addr not in proj._sim_procedures:
+            proj.hook(sym.rebased_addr, _ConcreteLibcStartMain())
+        for name in ("exit", "_exit", "_Exit"):
+            sym = proj.loader.find_symbol(name)
+            if sym is not None and sym.rebased_addr not in proj._sim_procedures:
+                proj.hook(sym.rebased_addr, ExitProcedure())

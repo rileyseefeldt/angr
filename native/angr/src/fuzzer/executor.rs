@@ -76,6 +76,7 @@ impl Executor<EM, I, S, Z> for PyExecutorInner<S> {
                         .getattr("UberIcicleEngine")?
                         .call1((project,))?;
                     engine.call_method0("enable_snapshot_mode")?;
+                    engine.call_method0("setup_concrete_hooks")?;
                     self.cached_engine = Some(engine.clone().unbind());
                     engine
                 };
