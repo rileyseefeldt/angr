@@ -7,7 +7,7 @@ use libafl::{
     state::HasExecutions,
 };
 use libafl_bolts::{AsSliceMut, tuples::RefIndexable};
-use pyo3::{exceptions::PyRuntimeError, prelude::*};
+use pyo3::prelude::*;
 
 use crate::fuzzer::{EM, I, OT, S, Z};
 
@@ -86,27 +86,43 @@ impl Executor<EM, I, S, Z> for PyExecutorInner<S> {
                     .getattr("Emulator")?
                     .call1((&icicle_engine, &copied_state))?;
 
-                // Step 2.5: Set return address as breakpoint to detect normal returns
+                // Step 2.5: Set breakpoints to detect normal returns.
+                //
+                // First, try the exit symbol (preferred for dynamically-linked
+                // binaries where _ConcreteLibcStartMain writes exit's address as
+                // main's return address).  Fall back to cc.return_addr for
+                // shellcode / statically-linked cases.
+                let loader = self
+                    .base_state
+                    .getattr(py, "project")?
+                    .getattr(py, "loader")?;
+                let exit_sym = loader.call_method1(py, "find_symbol", ("exit",))?;
+
+                if !exit_sym.is_none(py) {
+                    let exit_addr: u64 =
+                        exit_sym.getattr(py, "rebased_addr")?.extract(py)?;
+                    emulator.call_method1("add_breakpoint", (exit_addr,))?;
+                    emulator.call_method1("add_breakpoint", (exit_addr & !1,))?;
+                }
+
+                // Also honour cc.return_addr (for shellcode and cases where
+                // apply_fn explicitly sets a return address).
                 let calling_convention = self
                     .base_state
                     .getattr(py, "project")?
                     .getattr(py, "factory")?
                     .getattr(py, "cc")?
                     .call0(py)?;
-                let return_addr = calling_convention
+                if let Ok(return_addr) = calling_convention
                     .getattr(py, "return_addr")?
                     .getattr(py, "get_value")?
-                    .call1(py, (copied_state,))?
+                    .call1(py, (&copied_state,))?
                     .getattr(py, "concrete_value")?
                     .extract::<u64>(py)
-                    .map_err(|_| {
-                        PyRuntimeError::new_err(
-                            "Failed to extract return address, is it symbolic?".to_string(),
-                        )
-                    })?;
-
-                emulator.call_method1("add_breakpoint", (return_addr,))?;
-                emulator.call_method1("add_breakpoint", (return_addr & !1,))?;
+                {
+                    emulator.call_method1("add_breakpoint", (return_addr,))?;
+                    emulator.call_method1("add_breakpoint", (return_addr & !1,))?;
+                }
 
                 let exit = if let Some(limit) = self.max_icount {
                     emulator

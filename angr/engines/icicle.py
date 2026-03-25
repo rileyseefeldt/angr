@@ -160,6 +160,14 @@ class IcicleEngine(ConcreteEngine):
     For a more complete implementation, use the UberIcicleEngine class, which
     intends to provide a more complete set of features, such as hooks and syscalls.
 
+    .. note::
+
+        Breakpoints (including ``extra_stop_points``) must target addresses on
+        mapped pages.  Icicle ties breakpoints to JIT-translated blocks, so an
+        address on an unmapped page cannot host a breakpoint.  If you need a
+        sentinel return address for fuzzing, use a mapped address such as the
+        ``exit`` symbol rather than an arbitrary unmapped value.
+
     """
 
     def __init__(self, *args, **kwargs):
@@ -254,6 +262,36 @@ class IcicleEngine(ConcreteEngine):
         return metadata
 
     @staticmethod
+    def __resolve_got_entries(emu: Icicle, proj, mapped_pages: set[int], page_size: int) -> None:
+        """Patch GOT entries whose targets differ from CLE's resolved addresses.
+
+        Equivalent to LD_BIND_NOW=1 — avoids crashes when libc-internal PLT
+        calls jump to ld-linux's unmapped lazy resolver region.
+        """
+        import struct
+
+        arch = proj.arch
+        word_size = arch.bytes
+        fmt = (">" if arch.memory_endness == Endness.BE else "<") + ("I" if word_size == 4 else "Q")
+
+        for obj in proj.loader.all_objects:
+            for reloc in obj.relocs:
+                if not reloc.resolved or not reloc.resolvedby:
+                    continue
+                got_addr = getattr(reloc, "rebased_addr", None)
+                if not got_addr:
+                    continue
+                target = reloc.resolvedby.rebased_addr
+                if got_addr // page_size not in mapped_pages:
+                    continue
+                try:
+                    cur = struct.unpack(fmt, bytes(emu.mem_read(got_addr, word_size)))[0]
+                except RuntimeError:
+                    continue
+                if cur != target:
+                    emu.mem_write(got_addr, struct.pack(fmt, target))
+
+    @staticmethod
     def __convert_angr_state_to_icicle(state: HeavyConcreteState) -> tuple[Icicle, IcicleStateTranslationData]:
         icicle_arch = IcicleEngine.__make_icicle_arch(state.arch)
         if icicle_arch is None:
@@ -312,6 +350,8 @@ class IcicleEngine(ConcreteEngine):
 
             if perm_bits & 2:
                 writable_pages.add(page_num)
+
+        IcicleEngine.__resolve_got_entries(emu, proj, mapped_pages, state.memory.page_size)
 
         # Add breakpoints for simprocedures, skipping ifunc resolvers
         # which should run natively in the concrete engine.
@@ -645,6 +685,10 @@ class IcicleEngine(ConcreteEngine):
             # Continuation: sync registers + changed/dirty pages (no snapshot restore).
             changed = self._get_changed_writable_pages(state, self._live_translation_data.writable_pages)
             pages_to_sync = set(changed) | self._last_dirty_pages
+            # Pick up pages newly mapped by syscall handlers (e.g. mmap).
+            for page_num, page in state.memory._pages.items():
+                if page is not None and page_num not in self._live_translation_data.mapped_pages:
+                    pages_to_sync.add(page_num)
             translation_data = self.__sync_continuation(
                 self._cached_emu, state, self._live_translation_data, list(pages_to_sync)
             )
@@ -661,18 +705,6 @@ class IcicleEngine(ConcreteEngine):
             # Full init path
             emu, translation_data = self.__convert_angr_state_to_icicle(state)
 
-            # Map pages for extra stop points so they survive snapshot restore.
-            if extra_stop_points is not None:
-                is_arm = IcicleEngine.__is_arm(translation_data.icicle_arch)
-                page_size = state.memory.page_size
-                for bp_addr in extra_stop_points:
-                    if is_arm:
-                        bp_addr = bp_addr & ~1
-                    bp_page_num = bp_addr // page_size
-                    if bp_page_num not in translation_data.mapped_pages:
-                        emu.mem_map(bp_page_num * page_size, page_size, 5)  # r-x
-                        translation_data.mapped_pages.add(bp_page_num)
-
             if self._snapshot_mode and self._cached_emu is None:
                 emu.save_snapshot()
                 self._cached_emu = emu
@@ -685,7 +717,16 @@ class IcicleEngine(ConcreteEngine):
             for addr in extra_stop_points:
                 if is_arm:
                     addr = addr & ~1  # Clear thumb bit
-                if emu.pc != addr and emu.add_breakpoint(addr):
+                if emu.pc == addr:
+                    continue
+                bp_page = addr // state.memory.page_size
+                if bp_page not in translation_data.mapped_pages:
+                    log.debug(
+                        "Breakpoint at %#x skipped: page not mapped.",
+                        addr,
+                    )
+                    continue
+                if emu.add_breakpoint(addr):
                     added_breakpoints.append(addr)
         # Sync JIT counters for newly added breakpoints.
         if added_breakpoints:
@@ -706,7 +747,6 @@ class IcicleEngine(ConcreteEngine):
         for addr in added_breakpoints:
             emu.remove_breakpoint(addr)
 
-        page_size = state.memory.page_size
         self._last_dirty_pages = {addr // page_size for addr in emu.modified_pages}
 
         result = IcicleEngine.__convert_icicle_state_to_angr(emu, translation_data, status)
@@ -719,6 +759,19 @@ class IcicleEngine(ConcreteEngine):
         return result
 
 
+def _get_ctype_hooks():
+    """Return (name, class) pairs for ctype locale hooks, outside a class to avoid name mangling."""
+    from angr.procedures.glibc.__ctype_b_loc import __ctype_b_loc  # noqa: N812
+    from angr.procedures.glibc.__ctype_tolower_loc import __ctype_tolower_loc  # noqa: N812
+    from angr.procedures.glibc.__ctype_toupper_loc import __ctype_toupper_loc  # noqa: N812
+
+    return [
+        ("__ctype_b_loc", __ctype_b_loc),
+        ("__ctype_tolower_loc", __ctype_tolower_loc),
+        ("__ctype_toupper_loc", __ctype_toupper_loc),
+    ]
+
+
 def _extract_libc_start_main_args(state, main, argc, argv, init, fini):
     """Wrapper to avoid Python name-mangling of ``__libc_start_main``."""
     from angr.procedures.glibc.__libc_start_main import __libc_start_main  # noqa: N812
@@ -726,12 +779,27 @@ def _extract_libc_start_main_args(state, main, argc, argv, init, fini):
     return __libc_start_main._extract_args(state, main, argc, argv, init, fini)
 
 
+def _initialize_libc_data(proc: SimProcedure) -> None:
+    """Initialize ctype tables and errno via ``__libc_start_main`` helpers.
+
+    Must be called from inside a running SimProcedure (needs ``inline_call``).
+    """
+    from angr.procedures.glibc.__libc_start_main import __libc_start_main  # noqa: N812
+
+    # Must call each method individually (not _initialize_ctype_table)
+    # because it uses self.method() dispatch that won't resolve on our proc.
+    __libc_start_main._initialize_b_loc_table(proc)
+    __libc_start_main._initialize_tolower_loc_table(proc)
+    __libc_start_main._initialize_toupper_loc_table(proc)
+    __libc_start_main._initialize_errno(proc)
+
+
 class _ConcreteLibcStartMain(SimProcedure):
     """Lightweight ``__libc_start_main`` that skips glibc init and jumps to main.
 
-    Can't reuse the standard SimProcedure: it runs .init/.init_array constructors
-    that depend on TLS/locale icicle doesn't emulate, and pushes CallReturn as
-    main's return address instead of the sentinel the fuzzer expects.
+    Passes real argc/argv and uses ``exit`` as main's return sentinel.
+    Can't reuse the standard SimProcedure because it runs .init/.init_array
+    constructors that depend on TLS/locale icicle doesn't emulate.
     """
 
     NO_RET = True
@@ -740,19 +808,53 @@ class _ConcreteLibcStartMain(SimProcedure):
         main, argc, argv, _, _ = _extract_libc_start_main_args(
             self.state, main, argc, argv, init, fini
         )
+
+        _initialize_libc_data(self)
+
         self.state.regs.rdi = argc
         self.state.regs.rsi = argv
         envp = argv + (argc + 1) * self.state.arch.bytes
         self.state.regs.rdx = envp
-        # Write sentinel return address for the fuzzer's breakpoint.
+
+        sentinel = self._resolve_exit_addr()
         import claripy
 
         self.state.memory.store(
             self.state.regs.sp,
-            claripy.BVV(0xDEADBEEF, self.state.arch.bits),
+            claripy.BVV(sentinel, self.state.arch.bits),
             endness=self.state.arch.memory_endness,
         )
         self.jump(main)
+
+    def _resolve_exit_addr(self) -> int:
+        """Return the address of ``exit`` for use as main's return sentinel."""
+        proj = self.project
+        for name in ("exit", "_exit", "_Exit"):
+            sym = proj.loader.find_symbol(name)
+            if sym is not None:
+                return sym.rebased_addr
+        raise ValueError(
+            "Cannot find exit symbol for return sentinel; "
+            "ensure libc is loaded (auto_load_libs=True)"
+        )
+
+
+class _ConcreteClockGettime(SimProcedure):
+    """Concrete ``clock_gettime`` stub — the real implementation dispatches
+    through the vDSO which icicle doesn't map.  Returns wall time for any clock.
+    """
+
+    def run(self, which_clock, timespec_ptr):  # noqa: ARG002
+        import time as _time
+
+        if self.state.solver.is_true(timespec_ptr == 0):
+            return -1
+        flt = _time.time()
+        self.state.mem[timespec_ptr].struct.timespec = {
+            "tv_sec": int(flt),
+            "tv_nsec": int(flt * 1000000000) % 1000000000,
+        }
+        return 0
 
 
 class UberIcicleEngine(SimEngineFailure, SimEngineSyscall, HooksMixin, IcicleEngine):
@@ -763,12 +865,8 @@ class UberIcicleEngine(SimEngineFailure, SimEngineSyscall, HooksMixin, IcicleEng
     """
 
     def setup_concrete_hooks(self) -> None:
-        """Hook ``__libc_start_main`` and ``exit`` for concrete execution.
-
-        Replaces ``__libc_start_main`` with a lightweight version that skips
-        glibc init and hooks ``exit``/``_exit``/``_Exit`` for immediate
-        termination.  Required because glibc internals don't run correctly
-        under icicle.  Safe to call multiple times.
+        """Hook libc functions that don't work under icicle.  Safe to call
+        multiple times.
         """
         from angr.procedures.libc.exit import exit as ExitProcedure
 
@@ -780,3 +878,12 @@ class UberIcicleEngine(SimEngineFailure, SimEngineSyscall, HooksMixin, IcicleEng
             sym = proj.loader.find_symbol(name)
             if sym is not None and sym.rebased_addr not in proj._sim_procedures:
                 proj.hook(sym.rebased_addr, ExitProcedure())
+        for name in ("clock_gettime", "__clock_gettime"):
+            sym = proj.loader.find_symbol(name)
+            if sym is not None and sym.rebased_addr not in proj._sim_procedures:
+                proj.hook(sym.rebased_addr, _ConcreteClockGettime())
+        _ctype_hooks = _get_ctype_hooks()
+        for name, proc_cls in _ctype_hooks:
+            sym = proj.loader.find_symbol(name)
+            if sym is not None and sym.rebased_addr not in proj._sim_procedures:
+                proj.hook(sym.rebased_addr, proc_cls())
