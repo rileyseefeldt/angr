@@ -118,12 +118,12 @@ class Fuzzer:
         seed: int | None = None,
         max_mutations: int | None = None,
         mutator: HavocMutator | DeterministicMutator | None = None,
-        max_icount: int | None = None,
+        num_inst: int | None = None,
     ):
         """
         Initialize the fuzzer with the given parameters.
 
-        :param max_icount: Maximum number of instructions to execute per fuzzing
+        :param num_inst: Maximum number of instructions to execute per fuzzing
             iteration.  When set, each run is bounded to at most this many
             instructions; exceeding the limit is reported as a timeout.
         """
