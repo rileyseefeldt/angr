@@ -1071,7 +1071,13 @@ class CFGEmulated(ForwardAnalysis, CFGBase):  # pylint: disable=abstract-method
                     stmt_idx=pending_job_src_exit_stmt_idx,
                     ins_addr=pending_job.src_exit_ins_addr,
                 )
-
+                self._update_function_transition_graph(
+                    pending_job_src_block_id,
+                    pending_job_key,
+                    jumpkind="Ijk_FakeRet",
+                    stmt_idx=pending_job_src_exit_stmt_idx,
+                    confirmed=True,
+                )
                 return None
 
         pending_job_state.history.jumpkind = "Ijk_FakeRet"
@@ -1239,11 +1245,6 @@ class CFGEmulated(ForwardAnalysis, CFGBase):  # pylint: disable=abstract-method
         # Increment tracing count for this block
         self._traced_addrs[job.call_stack_suffix][addr] += 1
 
-        if self._keep_state:
-            # TODO: if we are reusing an existing CFGNode, we will be overwriting the original input state here. we
-            # TODO: should save them all, which, unfortunately, requires some redesigning :-(
-            cfg_node.input_state = sim_successors.initial_state
-
         # See if this job cancels another FakeRet
         # This should be done regardless of whether this job should be skipped or not, otherwise edges will go missing
         # in the CFG or function transition graphs.
@@ -1289,6 +1290,11 @@ class CFGEmulated(ForwardAnalysis, CFGBase):  # pylint: disable=abstract-method
 
             # We are good. Raise the exception and leave
             raise AngrSkipJobNotice
+
+        if self._keep_state:
+            # TODO: if we are reusing an existing CFGNode, we will be overwriting the original input state here. we
+            # TODO: should save them all, which, unfortunately, requires some redesigning :-(
+            cfg_node.input_state = sim_successors.initial_state
 
         self._update_thumb_addrs(sim_successors, job.state)
 

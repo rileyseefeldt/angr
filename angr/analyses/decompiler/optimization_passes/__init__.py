@@ -29,6 +29,10 @@ from .switch_default_case_duplicator import SwitchDefaultCaseDuplicator
 from .deadblock_remover import DeadblockRemover
 from .tag_slicer import TagSlicer
 from .inlined_string_transformation_simplifier import InlinedStringTransformationSimplifier
+from .inlined_memcpy_simplifier import InlinedMemcpySimplifier, InlinedMemcpySimplifierLate
+from .inlined_memset_simplifier import InlinedMemsetSimplifier, InlinedMemsetSimplifierLate
+from .inlined_strcpy_simplifier import InlinedStrcpySimplifier, InlinedStrcpySimplifierLate
+from .inlined_wcscpy_simplifier import InlinedWcscpySimplifier, InlinedWcscpySimplifierLate
 from .const_prop_reverter import ConstPropOptReverter
 from .call_stmt_rewriter import CallStatementRewriter
 from .duplication_reverter import DuplicationReverter
@@ -73,7 +77,15 @@ ALL_OPTIMIZATION_PASSES = [
     CodeMotionOptimization,
     CrossJumpReverter,
     FlipBooleanCmp,
+    InlinedMemcpySimplifier,
+    InlinedMemsetSimplifier,
+    InlinedStrcpySimplifier,
+    InlinedWcscpySimplifier,
     InlinedStringTransformationSimplifier,
+    InlinedMemcpySimplifierLate,
+    InlinedMemsetSimplifierLate,
+    InlinedStrcpySimplifierLate,
+    InlinedWcscpySimplifierLate,
     CallStatementRewriter,
     TagSlicer,
     ConditionConstantPropagation,
@@ -143,8 +155,16 @@ __all__ = (
     "FlipBooleanCmp",
     "ITEExprConverter",
     "ITERegionConverter",
+    "InlinedMemcpySimplifier",
+    "InlinedMemcpySimplifierLate",
+    "InlinedMemsetSimplifier",
+    "InlinedMemsetSimplifierLate",
+    "InlinedStrcpySimplifier",
+    "InlinedStrcpySimplifierLate",
     "InlinedStringTransformationSimplifier",
     "InlinedStrlenSimplifier",
+    "InlinedWcscpySimplifier",
+    "InlinedWcscpySimplifierLate",
     "LoweredSwitchSimplifier",
     "MipsGpSettingSimplifier",
     "ModSimplifier",
