@@ -196,7 +196,6 @@ class TestSnapshotSync(TestCase):
         shellcode = "ldr x1, [x0]"
         project = angr.load_shellcode(shellcode, "aarch64")
         engine = IcicleEngine(project)
-        engine.enable_snapshot_mode()
 
         state_opts = {
             "remove_options": {*o.symbolic},
@@ -244,6 +243,65 @@ class TestSnapshotSync(TestCase):
         assert len(result4.successors) == 1
         assert result4[0].regs.x1.concrete_value == 0xDD
 
+    def test_snapshot_sync_code_modification(self):
+        """Code at the entry address can differ between states; each branch must
+        re-lift instead of replaying a stale JIT'd block from a sibling state."""
+        # aarch64 `movz x0, #imm16` (hw=0, Rd=x0), little-endian byte order:
+        #   movz x0, #1 -> 0xD2800020
+        #   movz x0, #2 -> 0xD2800040
+        code_a = b"\x20\x00\x80\xd2"
+        code_b = b"\x40\x00\x80\xd2"
+
+        project = angr.load_shellcode(code_a, "aarch64")
+        engine = IcicleEngine(project)
+        state_opts = {
+            "remove_options": {*o.symbolic},
+            "add_options": {o.ZERO_FILL_UNCONSTRAINED_MEMORY, o.ZERO_FILL_UNCONSTRAINED_REGISTERS},
+        }
+
+        # First run: lifts code_a, takes the snapshot.
+        s1 = project.factory.blank_state(**state_opts)
+        assert engine.process(s1, num_inst=1)[0].regs.x0.concrete_value == 1
+
+        # Branch with code overwritten — the sync write to a previously-
+        # executed page must succeed AND drop the cached code_a block.
+        s2 = project.factory.blank_state(**state_opts)
+        s2.memory.store(project.entry, code_b)
+        assert engine.process(s2, num_inst=1)[0].regs.x0.concrete_value == 2
+
+        # Branch back to the snapshot's original code — the JIT block from
+        # the previous run must not survive the restore.
+        s3 = project.factory.blank_state(**state_opts)
+        assert engine.process(s3, num_inst=1)[0].regs.x0.concrete_value == 1
+
+    def test_snapshot_sync_new_readonly_page_content(self):
+        """A read-only page newly mapped between states must have its content
+        copied to the emu — not left as zeros."""
+        # ldr x1, [x0]
+        shellcode = "ldr x1, [x0]"
+        project = angr.load_shellcode(shellcode, "aarch64")
+        engine = IcicleEngine(project)
+        state_opts = {
+            "remove_options": {*o.symbolic},
+            "add_options": {o.ZERO_FILL_UNCONSTRAINED_MEMORY, o.ZERO_FILL_UNCONSTRAINED_REGISTERS},
+        }
+
+        # First run: establishes snapshot with no extra mappings.
+        s1 = project.factory.blank_state(**state_opts)
+        s1.regs.x0 = 0x10000
+        s1.memory.map_region(0x10000, 0x1000, 0b111)
+        s1.memory.store(0x10000, 0xAA, size=8, endness="Iend_LE")
+        assert engine.process(s1, num_inst=1)[0].regs.x1.concrete_value == 0xAA
+
+        # Branch: the load target is on a newly-mapped read-only page. The
+        # delta-sync must seed its content; otherwise the load reads zero.
+        s2 = project.factory.blank_state(**state_opts)
+        s2.regs.x0 = 0x20000
+        s2.memory.map_region(0x10000, 0x1000, 0b111)
+        s2.memory.map_region(0x20000, 0x1000, 0b101)  # R + X, no W
+        s2.memory.store(0x20000, 0xBB, size=8, endness="Iend_LE")
+        assert engine.process(s2, num_inst=1)[0].regs.x1.concrete_value == 0xBB
+
 
 class TestDirtyPageTracking(TestCase):
     """Unit tests for dirty page tracking optimization in the Icicle engine."""
@@ -285,7 +343,6 @@ class TestDirtyPageTracking(TestCase):
         project = angr.load_shellcode(shellcode, "aarch64")
 
         engine = IcicleEngine(project)
-        engine.enable_snapshot_mode()
 
         state_opts = {
             "remove_options": {*o.symbolic},
@@ -764,7 +821,7 @@ class TestEdgeHitmap(TestCase):
         assert hitmap_1 == hitmap_2
 
     def test_edge_hitmap_multiple_blocks(self):
-        shellcode = "xor rax, rax; inc rax; cmp rax, 5; jne $-8; nop"
+        shellcode = "xor rax, rax; loop: inc rax; cmp rax, 5; jne loop; hlt"
         project = angr.load_shellcode(shellcode, "x86_64")
         engine = IcicleEngine(project)
         init_state = project.factory.blank_state(
@@ -903,7 +960,6 @@ class TestContinuation(TestCase):
         project.hook(0x4, hook_nop, length=4)
 
         engine = UberIcicleEngine(project)
-        engine.enable_snapshot_mode()
         init_state = project.factory.blank_state(
             remove_options={*o.symbolic},
             add_options={o.ZERO_FILL_UNCONSTRAINED_MEMORY, o.ZERO_FILL_UNCONSTRAINED_REGISTERS},
