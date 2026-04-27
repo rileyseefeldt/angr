@@ -48,12 +48,10 @@ def setup_concrete_hooks(project):
 
     * ``__libc_start_main`` -- replaced by :class:`~angr.procedures.glibc.concrete_libc_start_main.ConcreteLibcStartMain`
     * ``exit`` / ``_exit`` / ``_Exit`` -- standard exit procedure
-    * ``clock_gettime`` / ``__clock_gettime`` -- concrete wall-clock stub
     * ``__ctype_b_loc``, ``__ctype_tolower_loc``, ``__ctype_toupper_loc`` -- locale tables
     """
     from angr.procedures.glibc.concrete_libc_start_main import ConcreteLibcStartMain
     from angr.procedures.libc.exit import exit as ExitProcedure
-    from angr.procedures.posix.sim_time import concrete_clock_gettime
     from angr.procedures.glibc.__ctype_b_loc import __ctype_b_loc  # noqa: N812
     from angr.procedures.glibc.__ctype_tolower_loc import __ctype_tolower_loc  # noqa: N812
     from angr.procedures.glibc.__ctype_toupper_loc import __ctype_toupper_loc  # noqa: N812
@@ -66,11 +64,6 @@ def setup_concrete_hooks(project):
         sym = project.loader.find_symbol(name)
         if sym is not None and sym.rebased_addr not in project._sim_procedures:
             project.hook(sym.rebased_addr, ExitProcedure())
-
-    for name in ("clock_gettime", "__clock_gettime"):
-        sym = project.loader.find_symbol(name)
-        if sym is not None and sym.rebased_addr not in project._sim_procedures:
-            project.hook(sym.rebased_addr, concrete_clock_gettime())
 
     for name, proc_cls in [
         ("__ctype_b_loc", __ctype_b_loc),

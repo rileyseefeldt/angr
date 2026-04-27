@@ -183,12 +183,11 @@ class SimSystemPosix(SimStatePlugin):
             # lrwx------ 1 audrey audrey 64 Jan 17 14:21 0 -> /dev/pts/4
             # lrwx------ 1 audrey audrey 64 Jan 17 14:21 1 -> /dev/pts/4
             # lrwx------ 1 audrey audrey 64 Jan 17 14:21 2 -> /dev/pts/4
-            # On a real system all three fds are read+write on the same tty.
-            # We keep separate backing streams so reads/writes can be
-            # distinguished, but every fd must be duplex.
+            # but we want to distinguish the streams. we compromise by having 0 and 1 go to the "tty"
+            # and stderr goes to a special stderr file
             fd[0] = tty
             fd[1] = tty
-            fd[2] = SimFileDescriptorDuplex(stdin, stderr)
+            fd[2] = SimFileDescriptor(stderr, 0)
 
         self.fd = fd
         # these are the storage mechanisms!

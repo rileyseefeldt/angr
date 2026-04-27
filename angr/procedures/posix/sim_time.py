@@ -46,23 +46,3 @@ class clock_gettime(angr.SimProcedure):
 
         self.state.mem[timespec_ptr].struct.timespec = result
         return 0
-
-
-class concrete_clock_gettime(angr.SimProcedure):
-    """Stub ``clock_gettime`` for concrete execution.
-
-    Unlike the symbolic-friendly :class:`clock_gettime` above, this variant
-    always returns the host wall-clock time and does **not** validate
-    *which_clock*.  This is useful when running under a concrete engine
-    (e.g. icicle) where the vDSO is not mapped.
-    """
-
-    def run(self, which_clock, timespec_ptr):  # noqa: ARG002
-        if self.state.solver.is_true(timespec_ptr == 0):
-            return -1
-        flt = time.time()
-        self.state.mem[timespec_ptr].struct.timespec = {
-            "tv_sec": int(flt),
-            "tv_nsec": int(flt * 1000000000) % 1000000000,
-        }
-        return 0
