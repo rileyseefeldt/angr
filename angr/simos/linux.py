@@ -3,6 +3,7 @@ import os
 import logging
 import struct
 
+import capstone
 import claripy
 from cle import MetaELF
 from cle.backends.elf.symbol import ELFSymbolType
@@ -14,6 +15,7 @@ from archinfo import ArchX86, ArchAMD64, ArchARM, ArchAArch64, ArchMIPS32, ArchM
 from angr.tablespecs import StringTableSpec
 from angr.procedures import SIM_PROCEDURES as P, SIM_LIBRARIES as L
 from angr.state_plugins import SimFilesystem, SimHostFilesystem
+from angr.state_plugins.libc import SimStateLibc
 from angr.storage.file import SimFile, SimFileBase
 from angr.errors import AngrSyscallError
 from .userland import SimUserland
@@ -25,6 +27,13 @@ class SimLinux(SimUserland):
     """
     OS-specific configuration for \\*nix-y OSes.
     """
+
+    # (helper symbol name, source array, struct-pack format, entry size in bytes)
+    _CTYPE_TABLES = (
+        ("__ctype_b_loc", SimStateLibc.LOCALE_ARRAY, "<H", 2),
+        ("__ctype_tolower_loc", SimStateLibc.TOLOWER_LOC_ARRAY, "<I", 4),
+        ("__ctype_toupper_loc", SimStateLibc.TOUPPER_LOC_ARRAY, "<I", 4),
+    )
 
     def __init__(self, project, **kwargs):
         super().__init__(
@@ -72,6 +81,17 @@ class SimLinux(SimUserland):
                 "_dl_get_tls_static_info", L["ld.so"][0].get("_dl_get_tls_static_info", self.arch)
             )  # ld
             self._weak_hook_symbol("_dl_vdso_vsym", L["libc.so.6"][0].get("_dl_vdso_vsym", self.arch))  # libc
+            # When use_sim_procedures=False the relocation-driven hook in project.py
+            # is skipped, so real __libc_start_main runs natively and faults on
+            # ld.so state we don't reproduce. Force-hook it (scoped to libc.so so
+            # static binaries are left for StaticHooker).
+            libc = self.project.loader.shared_objects.get("libc.so.6")
+            if libc is not None:
+                self._weak_hook_symbol(
+                    "__libc_start_main",
+                    L["libc.so.6"][0].get("__libc_start_main", self.arch),
+                    scope=libc,
+                )
 
             # set up some static data in the loader object...
             _rtld_global = self.project.loader.find_symbol("_rtld_global")
@@ -112,6 +132,8 @@ class SimLinux(SimUserland):
                     self.project.loader.memory.pack_word(tls_obj.thread_pointer + 0x30, 0x5054524755415244)
                 elif isinstance(self.project.arch, ArchX86):
                     self.project.loader.memory.pack_word(tls_obj.thread_pointer + 0x10, self.vsyscall_addr)
+
+            self._initialize_glibc_runtime()
 
         if isinstance(self.project.arch, ArchARM):
             # https://www.kernel.org/doc/Documentation/arm/kernel_user_helpers.txt
@@ -183,6 +205,58 @@ class SimLinux(SimUserland):
                             funcaddr=gotvalue,
                         )
                         self.project.hook(gotvalue, proc, replace=True)
+
+    def _initialize_glibc_runtime(self) -> None:
+        """Substitute for the glibc init phase: populate ctype TLS slots that
+        ``__ctype_init`` would normally fill, so real glibc helpers running
+        natively under a concrete engine see the values they expect (otherwise
+        ``__ctype_b_loc``'s ``mov rax, [rip+disp]; add rax, [fs:0]; ret`` returns
+        a zero pointer and faults on dereference).
+
+        The TLS slot is discovered by decoding the helper's prologue rather than
+        hard-coding offsets — glibc moves these slots between versions but the
+        instruction shape is stable.
+        """
+        if not isinstance(self.project.arch, ArchAMD64) or not self.project.loader.tls.threads:
+            return
+        libc = self.project.loader.shared_objects.get("libc.so.6")
+        if libc is None:
+            return
+
+        tp = self.project.loader.tls.threads[0].user_thread_pointer
+        for name, entries, fmt, esize in self._CTYPE_TABLES:
+            slot = self._resolve_libc_tls_slot(libc, name, tp)
+            if slot is None:
+                _l.warning("glibc runtime init: could not resolve TLS slot for %s", name)
+                continue
+            data = b"".join(struct.pack(fmt, c) if isinstance(c, int) else c for c in entries)
+            addr = self.project.loader.extern_object.allocate(size=len(data))
+            self.project.loader.memory.store(addr, data)
+            # Helpers return a pointer indexed by signed char, so offset by 128 entries.
+            self.project.loader.memory.pack_word(slot, addr + 128 * esize)
+
+    def _resolve_libc_tls_slot(self, libc, sym_name: str, tp: int) -> int | None:
+        """Decode ``endbr64?; mov reg, [rip+disp32]`` to find the TPOFF, then add tp."""
+        sym = libc.get_symbol(sym_name)
+        if sym is None:
+            return None
+        insns = [
+            i
+            for i in self.project.factory.block(sym.rebased_addr, size=12).capstone.insns
+            if i.mnemonic != "endbr64"
+        ]
+        if not insns or insns[0].mnemonic != "mov":
+            return None
+        op = insns[0].operands[1]
+        if op.type != capstone.x86.X86_OP_MEM or op.mem.base != capstone.x86.X86_REG_RIP:
+            return None
+        try:
+            tpoff = self.project.loader.memory.unpack_word(
+                insns[0].address + insns[0].size + op.mem.disp, signed=True
+            )
+        except KeyError:
+            return None
+        return (tp + tpoff) & ((1 << self.project.arch.bits) - 1)
 
     def syscall_abi(self, state):
         if state.arch.name != "AMD64":
